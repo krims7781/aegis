@@ -1,15 +1,3 @@
-"""
-Scrubber — detects and redacts PII and secrets from text.
-
-Two-layer detection:
-  1. Regex layer  — catches structured PII: emails, phone numbers, credit cards,
-                    IP addresses, API key patterns, JWTs, UUIDs.
-  2. Aho-Corasick — catches custom keyword patterns (names, org-specific tokens)
-                    in a single O(N) pass over the text.
-
-Both layers run on every payload and their results are unioned.
-"""
-
 import re
 import time
 from dataclasses import dataclass, field
@@ -17,13 +5,9 @@ from typing import Dict, List, Tuple
 
 from core.aho_corasick import AhoCorasick
 
-
-# ---------------------------------------------------------------------------
-# PII regex patterns
-# ---------------------------------------------------------------------------
 _PII_PATTERNS: Dict[str, str] = {
     "EMAIL":       r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
-    "PHONE_IN":    r"\+?91[-\s]?\d{10}|\b[6-9]\d{9}\b",          # Indian numbers
+    "PHONE_IN":    r"\+?91[-\s]?\d{10}|\b[6-9]\d{9}\b",
     "PHONE_US":    r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b",
     "CREDIT_CARD": r"\b(?:\d{4}[-\s]?){3}\d{4}\b",
     "SSN":         r"\b\d{3}-\d{2}-\d{4}\b",
@@ -43,28 +27,17 @@ _COMPILED: Dict[str, re.Pattern] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
 @dataclass
 class ScrubResult:
     original: str
     sanitized: str
-    redactions: List[Dict]          # [{label, value, start, end}]
+    redactions: List[Dict]
     processing_ms: float
     ac_matches: int = 0
     regex_matches: int = 0
 
 
-# ---------------------------------------------------------------------------
-# Scrubber
-# ---------------------------------------------------------------------------
 class Scrubber:
-    """
-    Stateless scrubber. Accepts optional extra keyword patterns for the
-    Aho-Corasick layer (e.g. employee names, project codenames).
-    """
-
     def __init__(self, extra_keywords: List[str] | None = None):
         self._ac = AhoCorasick()
         keywords = extra_keywords or []
@@ -74,10 +47,8 @@ class Scrubber:
             self._ac.build()
         self._has_ac = bool(keywords)
 
-    # ------------------------------------------------------------------
-    def scrub(self, text: str) -> ScrubResult:
+    def scrub(self, text: str, ac_engine: AhoCorasick | None = None) -> ScrubResult:
         t0 = time.perf_counter()
-
         redactions: List[Dict] = []
 
         # --- Regex layer ---
@@ -95,8 +66,9 @@ class Scrubber:
 
         # --- Aho-Corasick layer ---
         ac_count = 0
-        if self._has_ac:
-            for start, pattern in self._ac.search(text.lower()):
+        ac_to_use = ac_engine if ac_engine is not None else (self._ac if self._has_ac else None)
+        if ac_to_use is not None:
+            for start, pattern in ac_to_use.search(text.lower()):
                 redactions.append({
                     "label": "KEYWORD",
                     "value": text[start: start + len(pattern)],
@@ -106,11 +78,9 @@ class Scrubber:
                 })
                 ac_count += 1
 
-        # --- Build sanitized string (replace with [LABEL] tokens) ---
-        # Sort by start position, resolve overlaps by keeping first match
+        # --- Apply redactions ---
         redactions.sort(key=lambda r: r["start"])
         redactions = _resolve_overlaps(redactions)
-
         sanitized = _apply_redactions(text, redactions)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -125,11 +95,7 @@ class Scrubber:
         )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def _resolve_overlaps(redactions: List[Dict]) -> List[Dict]:
-    """Remove overlapping spans, keeping earlier (longer) matches."""
     result = []
     last_end = -1
     for r in redactions:
